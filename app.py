@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 from engine import *
 from news_intelligence import combined_regime
-
+from oracle_bot import render_oracle_bot
 st.set_page_config(page_title="Garibaldi Market Oracle — $10 Challenge", page_icon="💹", layout="wide")
 st.markdown("""
 <style>
@@ -50,7 +50,16 @@ with r:
 
 st.info("Each side begins with $10 in fake money. Fractional shares and crypto are allowed. Cash-market fills occur only during regular U.S. market hours; crypto can trade 24/7.")
 board=st.radio("Inspect a board",["Cash","Crypto"],horizontal=True).lower()
-tabs=st.tabs(["Equity curve","Open positions","Paper trades","Live decisions","Market intelligence","Literacy lab","Bot health"])
+tabs=st.tabstabs=st.tabs([
+    "Equity curve",
+    "Open positions",
+    "Paper trades",
+    "Live decisions",
+    "Market intelligence",
+    "Literacy lab",
+    "Bot health",
+    "Ask the Oracle"
+])
 with tabs[0]:
     x=equity_df(board)
     if x.empty: st.write("No equity-history points yet. Run a scan or wait for the bot.")
@@ -85,5 +94,6 @@ The algorithm combines trend, momentum, RSI, volatility, headline regime, stop l
 with tabs[6]:
     st.dataframe(status_df(),width="stretch",hide_index=True)
     st.caption("Refreshed "+datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
-
+with tabs[7]:
+    render_oracle_bot()
 st.divider(); st.caption("Educational paper trading only. No real broker orders. No guarantee of profit or of turning $10 into wealth. Public market data and RSS feeds can be delayed or unavailable.")
