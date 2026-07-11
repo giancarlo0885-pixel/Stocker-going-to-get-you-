@@ -1,0 +1,442 @@
+from __future__ import annotations
+
+"""
+GARIBALDI MARKET ORACLE - API Manager
+
+Put this file in the root of:
+Stocker-going-to-get-you-
+
+Railway variables supported:
+    FINNHUB_API_KEY
+    POLYGON_API_KEY
+    FMP_API_KEY
+    NEWS_API_KEY
+
+The manager:
+- detects which keys are configured
+- safely calls providers
+- falls back when a provider is unavailable
+- returns provider status for Streamlit
+- never prints or exposes secret keys
+"""
+
+import os
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Any
+
+import pandas as pd
+import requests
+
+
+TIMEOUT_SECONDS = 12
+USER_AGENT = "Garibaldi-Market-Oracle/2.0"
+
+
+@dataclass(frozen=True)
+class ProviderStatus:
+    provider: str
+    variable: str
+    configured: bool
+    purpose: str
+
+
+def _key(name: str) -> str:
+    return os.getenv(name, "").strip()
+
+
+def provider_statuses() -> list[ProviderStatus]:
+    return [
+        ProviderStatus(
+            "Finnhub",
+            "FINNHUB_API_KEY",
+            bool(_key("FINNHUB_API_KEY")),
+            "Analyst ratings, insiders, earnings and company profiles",
+        ),
+        ProviderStatus(
+            "Polygon",
+            "POLYGON_API_KEY",
+            bool(_key("POLYGON_API_KEY")),
+            "Stock details, price aggregates and ticker news",
+        ),
+        ProviderStatus(
+            "Financial Modeling Prep",
+            "FMP_API_KEY",
+            bool(_key("FMP_API_KEY")),
+            "Ratios, key metrics, growth and fundamentals",
+        ),
+        ProviderStatus(
+            "NewsAPI",
+            "NEWS_API_KEY",
+            bool(_key("NEWS_API_KEY")),
+            "Broader company and market news",
+        ),
+    ]
+
+
+def provider_status_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Provider": item.provider,
+                "Railway variable": item.variable,
+                "Status": "Connected" if item.configured else "Not configured",
+                "Purpose": item.purpose,
+            }
+            for item in provider_statuses()
+        ]
+    )
+
+
+def _get_json(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    merged_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        merged_headers.update(headers)
+
+    response = requests.get(
+        url,
+        params=params or {},
+        headers=merged_headers,
+        timeout=TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def finnhub_get(endpoint: str, **params: Any) -> Any:
+    token = _key("FINNHUB_API_KEY")
+    if not token:
+        raise RuntimeError("FINNHUB_API_KEY is not configured.")
+
+    return _get_json(
+        f"https://finnhub.io/api/v1/{endpoint.lstrip('/')}",
+        params={**params, "token": token},
+    )
+
+
+def polygon_get(endpoint: str, **params: Any) -> Any:
+    token = _key("POLYGON_API_KEY")
+    if not token:
+        raise RuntimeError("POLYGON_API_KEY is not configured.")
+
+    return _get_json(
+        f"https://api.polygon.io/{endpoint.lstrip('/')}",
+        params={**params, "apiKey": token},
+    )
+
+
+def fmp_get(endpoint: str, **params: Any) -> Any:
+    token = _key("FMP_API_KEY")
+    if not token:
+        raise RuntimeError("FMP_API_KEY is not configured.")
+
+    return _get_json(
+        f"https://financialmodelingprep.com/stable/{endpoint.lstrip('/')}",
+        params={**params, "apikey": token},
+    )
+
+
+def newsapi_get(endpoint: str = "everything", **params: Any) -> Any:
+    token = _key("NEWS_API_KEY")
+    if not token:
+        raise RuntimeError("NEWS_API_KEY is not configured.")
+
+    return _get_json(
+        f"https://newsapi.org/v2/{endpoint.lstrip('/')}",
+        params={**params, "apiKey": token},
+    )
+
+
+def safe_call(provider: str, callback, default: Any) -> tuple[Any, str]:
+    try:
+        return callback(), provider
+    except Exception as exc:
+        return default, f"{provider} unavailable: {type(exc).__name__}"
+
+
+def get_company_profile(symbol: str) -> tuple[dict[str, Any], str]:
+    symbol = symbol.upper().strip()
+
+    if _key("FINNHUB_API_KEY"):
+        data, source = safe_call(
+            "Finnhub",
+            lambda: finnhub_get("stock/profile2", symbol=symbol),
+            {},
+        )
+        if data:
+            return {
+                "symbol": symbol,
+                "name": data.get("name"),
+                "industry": data.get("finnhubIndustry"),
+                "exchange": data.get("exchange"),
+                "country": data.get("country"),
+                "market_cap": data.get("marketCapitalization"),
+                "website": data.get("weburl"),
+            }, source
+
+    if _key("POLYGON_API_KEY"):
+        data, source = safe_call(
+            "Polygon",
+            lambda: polygon_get(f"v3/reference/tickers/{symbol}"),
+            {},
+        )
+        result = data.get("results", {}) if isinstance(data, dict) else {}
+        if result:
+            return {
+                "symbol": symbol,
+                "name": result.get("name"),
+                "industry": result.get("sic_description"),
+                "exchange": result.get("primary_exchange"),
+                "country": result.get("locale"),
+                "market_cap": result.get("market_cap"),
+                "website": (result.get("homepage_url") or ""),
+            }, source
+
+    return {}, "No connected profile provider returned data"
+
+
+def get_analyst_recommendations(symbol: str) -> tuple[dict[str, Any], str]:
+    if not _key("FINNHUB_API_KEY"):
+        return {}, "FINNHUB_API_KEY not configured"
+
+    data, source = safe_call(
+        "Finnhub",
+        lambda: finnhub_get("stock/recommendation", symbol=symbol.upper()),
+        [],
+    )
+    if not data:
+        return {}, source
+
+    row = data[0]
+    return {
+        "period": row.get("period"),
+        "strong_buy": row.get("strongBuy", 0),
+        "buy": row.get("buy", 0),
+        "hold": row.get("hold", 0),
+        "sell": row.get("sell", 0),
+        "strong_sell": row.get("strongSell", 0),
+    }, source
+
+
+def get_insider_sentiment(
+    symbol: str,
+    days: int = 180,
+) -> tuple[dict[str, Any], str]:
+    if not _key("FINNHUB_API_KEY"):
+        return {}, "FINNHUB_API_KEY not configured"
+
+    end = date.today()
+    start = end - timedelta(days=days)
+
+    data, source = safe_call(
+        "Finnhub",
+        lambda: finnhub_get(
+            "stock/insider-sentiment",
+            symbol=symbol.upper(),
+            **{"from": start.isoformat(), "to": end.isoformat()},
+        ),
+        {},
+    )
+    rows = data.get("data", []) if isinstance(data, dict) else []
+    if not rows:
+        return {}, source
+
+    recent = rows[-6:]
+    return {
+        "months": len(recent),
+        "average_mspr": sum(float(x.get("mspr", 0) or 0) for x in recent)
+        / len(recent),
+        "net_change": sum(float(x.get("change", 0) or 0) for x in recent),
+    }, source
+
+
+def get_upcoming_earnings(
+    symbol: str,
+    days: int = 60,
+) -> tuple[dict[str, Any], str]:
+    if not _key("FINNHUB_API_KEY"):
+        return {}, "FINNHUB_API_KEY not configured"
+
+    start = date.today()
+    end = start + timedelta(days=days)
+
+    data, source = safe_call(
+        "Finnhub",
+        lambda: finnhub_get(
+            "calendar/earnings",
+            symbol=symbol.upper(),
+            **{"from": start.isoformat(), "to": end.isoformat()},
+        ),
+        {},
+    )
+    rows = data.get("earningsCalendar", []) if isinstance(data, dict) else []
+    if not rows:
+        return {}, source
+
+    row = rows[0]
+    return {
+        "date": row.get("date"),
+        "hour": row.get("hour"),
+        "eps_estimate": row.get("epsEstimate"),
+        "revenue_estimate": row.get("revenueEstimate"),
+    }, source
+
+
+def get_fundamentals(symbol: str) -> tuple[dict[str, Any], str]:
+    if not _key("FMP_API_KEY"):
+        return {}, "FMP_API_KEY not configured"
+
+    symbol = symbol.upper()
+    ratios, ratios_source = safe_call(
+        "FMP",
+        lambda: fmp_get("ratios-ttm", symbol=symbol),
+        [],
+    )
+    metrics, metrics_source = safe_call(
+        "FMP",
+        lambda: fmp_get("key-metrics-ttm", symbol=symbol),
+        [],
+    )
+
+    ratio_row = ratios[0] if isinstance(ratios, list) and ratios else {}
+    metric_row = metrics[0] if isinstance(metrics, list) and metrics else {}
+
+    if not ratio_row and not metric_row:
+        return {}, f"{ratios_source}; {metrics_source}"
+
+    return {
+        "pe_ratio": ratio_row.get("priceToEarningsRatioTTM")
+        or ratio_row.get("priceEarningsRatioTTM"),
+        "price_to_sales": ratio_row.get("priceToSalesRatioTTM"),
+        "current_ratio": ratio_row.get("currentRatioTTM"),
+        "debt_to_equity": ratio_row.get("debtToEquityRatioTTM"),
+        "net_margin": ratio_row.get("netProfitMarginTTM"),
+        "return_on_equity": ratio_row.get("returnOnEquityTTM"),
+        "free_cash_flow_yield": metric_row.get("freeCashFlowYieldTTM"),
+        "enterprise_value": metric_row.get("enterpriseValueTTM"),
+    }, "FMP"
+
+
+def get_company_news(
+    symbol: str,
+    company_name: str | None = None,
+    days: int = 7,
+    limit: int = 20,
+) -> tuple[list[dict[str, Any]], str]:
+    symbol = symbol.upper()
+    start = date.today() - timedelta(days=days)
+    end = date.today()
+
+    if _key("POLYGON_API_KEY"):
+        data, source = safe_call(
+            "Polygon",
+            lambda: polygon_get(
+                "v2/reference/news",
+                ticker=symbol,
+                limit=limit,
+                order="desc",
+                sort="published_utc",
+            ),
+            {},
+        )
+        rows = data.get("results", []) if isinstance(data, dict) else []
+        if rows:
+            return [
+                {
+                    "title": row.get("title"),
+                    "description": row.get("description"),
+                    "url": row.get("article_url"),
+                    "source": (row.get("publisher") or {}).get("name"),
+                    "published": row.get("published_utc"),
+                    "provider": "Polygon",
+                }
+                for row in rows[:limit]
+            ], source
+
+    if _key("FINNHUB_API_KEY"):
+        data, source = safe_call(
+            "Finnhub",
+            lambda: finnhub_get(
+                "company-news",
+                symbol=symbol,
+                **{"from": start.isoformat(), "to": end.isoformat()},
+            ),
+            [],
+        )
+        if isinstance(data, list) and data:
+            return [
+                {
+                    "title": row.get("headline"),
+                    "description": row.get("summary"),
+                    "url": row.get("url"),
+                    "source": row.get("source"),
+                    "published": row.get("datetime"),
+                    "provider": "Finnhub",
+                }
+                for row in data[:limit]
+            ], source
+
+    if _key("NEWS_API_KEY"):
+        query = company_name or symbol
+        data, source = safe_call(
+            "NewsAPI",
+            lambda: newsapi_get(
+                "everything",
+                q=query,
+                language="en",
+                sortBy="publishedAt",
+                pageSize=limit,
+                **{"from": start.isoformat()},
+            ),
+            {},
+        )
+        rows = data.get("articles", []) if isinstance(data, dict) else []
+        if rows:
+            return [
+                {
+                    "title": row.get("title"),
+                    "description": row.get("description"),
+                    "url": row.get("url"),
+                    "source": (row.get("source") or {}).get("name"),
+                    "published": row.get("publishedAt"),
+                    "provider": "NewsAPI",
+                }
+                for row in rows[:limit]
+            ], source
+
+    return [], "No connected news provider returned data"
+
+
+def get_oracle_data_bundle(symbol: str) -> dict[str, Any]:
+    """One-call research bundle for oracle_bot.py."""
+    profile, profile_source = get_company_profile(symbol)
+    analyst, analyst_source = get_analyst_recommendations(symbol)
+    insiders, insider_source = get_insider_sentiment(symbol)
+    earnings, earnings_source = get_upcoming_earnings(symbol)
+    fundamentals, fundamentals_source = get_fundamentals(symbol)
+    news, news_source = get_company_news(
+        symbol,
+        company_name=profile.get("name") if profile else None,
+    )
+
+    return {
+        "profile": profile,
+        "analyst": analyst,
+        "insiders": insiders,
+        "earnings": earnings,
+        "fundamentals": fundamentals,
+        "news": news,
+        "sources": {
+            "profile": profile_source,
+            "analyst": analyst_source,
+            "insiders": insider_source,
+            "earnings": earnings_source,
+            "fundamentals": fundamentals_source,
+            "news": news_source,
+        },
+    }
