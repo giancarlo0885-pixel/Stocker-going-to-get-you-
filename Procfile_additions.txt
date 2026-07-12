@@ -1,0 +1,3 @@
+# Keep your existing web line. Railway normally uses one service per command.
+web: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+worker: python enhanced_worker.py
