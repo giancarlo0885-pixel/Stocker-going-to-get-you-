@@ -1,0 +1,15 @@
+Create a second Railway service from the same GitHub repository.
+
+Start Command:
+python upgrade_worker.py
+
+Recommended variables:
+PAPER_DB_PATH=/data/paper_trading.db
+WORKER_HEARTBEAT_PATH=/data/oracle_worker_heartbeat.json
+ORACLE_SCAN_INTERVAL_SECONDS=900
+FINNHUB_API_KEY=your_key_here
+
+Mount a Railway volume at:
+/data
+
+This worker is for market intelligence and simulated paper trading only.
