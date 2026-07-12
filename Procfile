@@ -1,2 +1,1 @@
-web: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
-worker: python oracle_worker.py
+web: bash start.sh

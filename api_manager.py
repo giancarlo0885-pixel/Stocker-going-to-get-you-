@@ -1,21 +1,34 @@
-import os
-import pandas as pd
+from __future__ import annotations
 
-def provider_status_frame():
-    return pd.DataFrame([
-        {"Provider":"Finnhub","Variable":"FINNHUB_API_KEY","Connected":bool(os.getenv("FINNHUB_API_KEY"))},
-        {"Provider":"Polygon","Variable":"POLYGON_API_KEY","Connected":bool(os.getenv("POLYGON_API_KEY"))},
-        {"Provider":"Financial Modeling Prep","Variable":"FMP_API_KEY","Connected":bool(os.getenv("FMP_API_KEY"))},
-        {"Provider":"NewsAPI","Variable":"NEWS_API_KEY","Connected":bool(os.getenv("NEWS_API_KEY"))},
-    ])
+from dataclasses import dataclass
+from typing import Optional
+import requests
 
-def get_oracle_data_bundle(symbol):
-    return {
-        "profile":{},
-        "analyst":{},
-        "insiders":{},
-        "earnings":{},
-        "fundamentals":{},
-        "news":[],
-        "sources":{}
-    }
+from config import settings
+
+
+@dataclass(frozen=True)
+class APIStatus:
+    name: str
+    configured: bool
+    purpose: str
+
+
+def request_json(
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    timeout: int = 15,
+) -> dict | list:
+    response = requests.get(url, params=params, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def api_statuses() -> list[APIStatus]:
+    return [
+        APIStatus("Finnhub", bool(settings.finnhub_api_key), "Optional company news"),
+        APIStatus("OpenAI", bool(settings.openai_api_key), "Optional plain-language AI answers"),
+        APIStatus("Database", True, "PostgreSQL when DATABASE_URL exists; SQLite otherwise"),
+    ]

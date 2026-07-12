@@ -1,93 +1,163 @@
 from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import math
+import time
+from typing import Iterable
+
 import numpy as np
 import pandas as pd
-import requests
-try:
-    import yfinance as yf
-except Exception:
-    yf = None
+import yfinance as yf
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 GaribaldiMarketOracle/2.0"})
-BINANCE = {"BTC-USD":"BTCUSDT","ETH-USD":"ETHUSDT","SOL-USD":"SOLUSDT","XRP-USD":"XRPUSDT","DOGE-USD":"DOGEUSDT"}
-COINGECKO = {"BTC-USD":"bitcoin","ETH-USD":"ethereum","SOL-USD":"solana","XRP-USD":"ripple","DOGE-USD":"dogecoin"}
 
-def normalize(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    x = df.copy()
-    if isinstance(x.columns, pd.MultiIndex):
-        x.columns = x.columns.get_level_values(0)
-    x = x.rename(columns={"Adj Close":"Close"})
-    for c in ("Open","High","Low","Close","Volume"):
-        if c not in x.columns:
-            x[c] = np.nan
-        x[c] = pd.to_numeric(x[c], errors="coerce")
-    return x.dropna(subset=["Close"])[["Open","High","Low","Close","Volume"]]
+CRYPTO_ALIASES = {
+    "BTC": "BTC-USD", "BITCOIN": "BTC-USD",
+    "ETH": "ETH-USD", "ETHEREUM": "ETH-USD",
+    "SOL": "SOL-USD", "SOLANA": "SOL-USD",
+    "XRP": "XRP-USD", "DOGE": "DOGE-USD", "ADA": "ADA-USD",
+}
 
-def yahoo_chart(symbol: str) -> pd.DataFrame:
-    r = SESSION.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}", params={"range":"5d","interval":"15m","includePrePost":"true"}, timeout=15)
-    r.raise_for_status()
-    result = r.json().get("chart",{}).get("result") or []
-    if not result:
-        return pd.DataFrame()
-    item = result[0]
-    ts = item.get("timestamp") or []
-    q = (item.get("indicators",{}).get("quote") or [{}])[0]
-    if not ts:
-        return pd.DataFrame()
-    n = len(ts)
-    def pad(v):
-        v = v or []
-        return (list(v) + [None]*n)[:n]
-    return normalize(pd.DataFrame({
-        "Datetime":pd.to_datetime(ts, unit="s", utc=True),
-        "Open":pad(q.get("open")),"High":pad(q.get("high")),"Low":pad(q.get("low")),"Close":pad(q.get("close")),"Volume":pad(q.get("volume"))
-    }).set_index("Datetime"))
+_CACHE: dict[tuple[str, str, str], tuple[float, pd.DataFrame]] = {}
+CACHE_SECONDS = 60
 
-def binance(symbol: str) -> pd.DataFrame:
-    pair = BINANCE.get(symbol)
-    if not pair:
-        return pd.DataFrame()
-    r = SESSION.get("https://api.binance.us/api/v3/klines", params={"symbol":pair,"interval":"15m","limit":500}, timeout=15)
-    r.raise_for_status()
-    rows = r.json()
-    if not rows:
-        return pd.DataFrame()
-    cols = ["open_time","Open","High","Low","Close","Volume","close_time","quote_volume","trades","taker_base","taker_quote","ignore"]
-    x = pd.DataFrame(rows, columns=cols)
-    x["Datetime"] = pd.to_datetime(x["open_time"], unit="ms", utc=True)
-    return normalize(x.set_index("Datetime"))
 
-def coingecko(symbol: str) -> pd.DataFrame:
-    coin = COINGECKO.get(symbol)
-    if not coin:
-        return pd.DataFrame()
-    r = SESSION.get(f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart", params={"vs_currency":"usd","days":5}, timeout=15)
-    r.raise_for_status()
-    prices = r.json().get("prices") or []
-    if not prices:
-        return pd.DataFrame()
-    x = pd.DataFrame(prices, columns=["ms","Close"])
-    x["Datetime"] = pd.to_datetime(x["ms"], unit="ms", utc=True)
-    x["Open"] = x["High"] = x["Low"] = x["Close"]
-    x["Volume"] = np.nan
-    return normalize(x.set_index("Datetime"))
+@dataclass(frozen=True)
+class MarketSnapshot:
+    symbol: str
+    price: float
+    previous_close: float
+    change: float
+    change_pct: float
+    volume: float
+    timestamp: str
 
-def load_history(symbol: str, market: str):
-    providers = []
-    if yf is not None:
-        providers.append(("Yahoo Finance", lambda: yf.download(symbol, period="5d", interval="15m", auto_adjust=True, progress=False, threads=False, prepost=True)))
-    providers.append(("Yahoo Chart API", lambda: yahoo_chart(symbol)))
-    if market == "crypto":
-        providers += [("Binance.US", lambda: binance(symbol)), ("CoinGecko", lambda: coingecko(symbol))]
-    errors = []
-    for name, fn in providers:
+
+def normalize_symbol(symbol: str, asset_type: str | None = None) -> str:
+    raw = symbol.strip().upper().replace(" ", "")
+    if not raw:
+        raise ValueError("Enter a symbol.")
+
+    if asset_type == "Crypto":
+        return CRYPTO_ALIASES.get(raw, raw if "-" in raw else f"{raw}-USD")
+    if asset_type == "Fiat / FX":
+        if raw.endswith("=X"):
+            return raw
+        if "/" in raw:
+            left, right = raw.split("/", 1)
+            return f"{left}{right}=X"
+        return f"{raw}=X" if len(raw) == 6 else raw
+    return CRYPTO_ALIASES.get(raw, raw)
+
+
+def history(symbol: str, period: str = "1y", interval: str = "1d", asset_type: str | None = None) -> pd.DataFrame:
+    normalized = normalize_symbol(symbol, asset_type)
+    key = (normalized, period, interval)
+    cached = _CACHE.get(key)
+    if cached and time.time() - cached[0] < CACHE_SECONDS:
+        return cached[1].copy()
+
+    frame = yf.download(
+        normalized,
+        period=period,
+        interval=interval,
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+    if frame.empty:
+        raise ValueError(f"No market history was returned for {normalized}.")
+
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = [c[0] for c in frame.columns]
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col not in frame.columns:
+            frame[col] = np.nan
+
+    frame = frame[["Open", "High", "Low", "Close", "Volume"]].copy()
+    frame["Close"] = pd.to_numeric(frame["Close"], errors="coerce")
+    frame = frame.dropna(subset=["Close"])
+    if len(frame) < 2:
+        raise ValueError(f"Not enough usable data for {normalized}.")
+
+    _CACHE[key] = (time.time(), frame.copy())
+    return frame
+
+
+def latest_snapshot(symbol: str, asset_type: str | None = None) -> MarketSnapshot:
+    normalized = normalize_symbol(symbol, asset_type)
+    frame = history(normalized, period="10d", interval="1d")
+    close = frame["Close"].dropna()
+    price = float(close.iloc[-1])
+    previous = float(close.iloc[-2]) if len(close) > 1 else price
+    change = price - previous
+    volume_series = pd.to_numeric(frame["Volume"], errors="coerce").dropna()
+
+    return MarketSnapshot(
+        symbol=normalized,
+        price=price,
+        previous_close=previous,
+        change=change,
+        change_pct=(change / previous * 100.0) if previous else 0.0,
+        volume=float(volume_series.iloc[-1]) if len(volume_series) else 0.0,
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+
+
+def technical_features(symbol: str, asset_type: str | None = None) -> dict:
+    frame = history(symbol, period="2y", interval="1d", asset_type=asset_type)
+    close = frame["Close"].dropna()
+    returns = np.log(close / close.shift(1)).dropna()
+    current = float(close.iloc[-1])
+
+    ma20 = float(close.tail(20).mean())
+    ma50 = float(close.tail(50).mean())
+    ma200 = float(close.tail(200).mean()) if len(close) >= 200 else float(close.mean())
+
+    delta = close.diff()
+    gains = delta.clip(lower=0).rolling(14).mean()
+    losses = -delta.clip(upper=0).rolling(14).mean()
+    rs = gains / losses.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    rsi14 = float(rsi.dropna().iloc[-1]) if not rsi.dropna().empty else 50.0
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
+
+    rolling_std = close.rolling(20).std()
+    bb_upper = ma20 + 2 * float(rolling_std.iloc[-1])
+    bb_lower = ma20 - 2 * float(rolling_std.iloc[-1])
+
+    volatility = float(returns.tail(min(252, len(returns))).std(ddof=1) * math.sqrt(252))
+    momentum_20 = float(current / close.iloc[-21] - 1) if len(close) > 21 else 0.0
+    max_drawdown = float((close / close.cummax() - 1).min())
+
+    return {
+        "symbol": normalize_symbol(symbol, asset_type),
+        "price": current,
+        "ma20": ma20,
+        "ma50": ma50,
+        "ma200": ma200,
+        "rsi14": rsi14,
+        "macd": float(macd.iloc[-1]),
+        "macd_signal": float(macd_signal.iloc[-1]),
+        "bb_upper": bb_upper,
+        "bb_lower": bb_lower,
+        "volatility": volatility,
+        "momentum_20": momentum_20,
+        "max_drawdown": max_drawdown,
+        "history_rows": len(close),
+    }
+
+
+def batch_snapshots(symbols: Iterable[str]) -> list[MarketSnapshot]:
+    items = []
+    for symbol in symbols:
         try:
-            x = normalize(fn())
-            if len(x) >= 30:
-                return x, name
-            errors.append(f"{name}: insufficient data")
-        except Exception as exc:
-            errors.append(f"{name}: {type(exc).__name__}")
-    return pd.DataFrame(), " | ".join(errors)
+            items.append(latest_snapshot(symbol))
+        except Exception:
+            continue
+    return items

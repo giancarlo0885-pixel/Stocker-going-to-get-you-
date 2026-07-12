@@ -1,43 +1,120 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from urllib.parse import quote_plus
+from datetime import datetime, timedelta, timezone
+import re
+
 import feedparser
-import pandas as pd
 
-QUERIES = {
-    "cash":"stocks bonds dollar Federal Reserve earnings global market",
-    "crypto":"bitcoin ethereum crypto regulation ETF global market",
+from api_manager import request_json
+from config import settings
+
+
+@dataclass(frozen=True)
+class NewsItem:
+    headline: str
+    source: str
+    url: str
+    published_at: str
+    sentiment: str
+    score: int
+    summary: str
+
+
+POSITIVE = {
+    "beat", "growth", "surge", "gain", "record", "approval", "partnership",
+    "profit", "upgrade", "bullish", "expansion", "strong", "rally", "adoption",
 }
-RISK = {"war","attack","sanction","tariff","recession","default","crisis","collapse","fraud","hack","ban","inflation","layoffs","missile"}
-POS = {"growth","rally","approval","cut","deal","surge","record","expansion","profit","upgrade","adoption","ceasefire"}
+NEGATIVE = {
+    "miss", "loss", "drop", "decline", "lawsuit", "investigation", "downgrade",
+    "bearish", "warning", "fraud", "ban", "weak", "recession", "default", "hack",
+}
 
-@dataclass
-class NewsRegime:
-    score: float
-    label: str
-    explanation: str
-    headlines: pd.DataFrame
 
-def fetch_news(topic: str, limit: int = 20) -> pd.DataFrame:
-    q = QUERIES.get(topic, topic)
-    url = "https://news.google.com/rss/search?q=" + quote_plus(q) + "&hl=en-US&gl=US&ceid=US:en"
-    feed = feedparser.parse(url)
-    rows = []
-    for e in feed.entries[:limit]:
-        rows.append({"published":e.get("published",""),"title":e.get("title",""),"link":e.get("link",""),"source":(e.get("source") or {}).get("title","Google News")})
-    return pd.DataFrame(rows)
+def score_text(text: str) -> tuple[str, int]:
+    words = set(re.findall(r"[a-zA-Z]+", text.lower()))
+    raw = len(words & POSITIVE) - len(words & NEGATIVE)
+    score = max(0, min(100, 50 + raw * 10))
+    label = "Positive" if score > 55 else "Negative" if score < 45 else "Neutral"
+    return label, score
 
-def combined_regime(topic: str) -> NewsRegime:
-    x = fetch_news(topic)
-    if x.empty:
-        return NewsRegime(0.0,"Neutral","No current headlines were available, so news is not changing position size.",x)
-    raw = 0
-    for title in x["title"].fillna("").astype(str):
-        words = {w.strip(".,:;!?()[]{}'\"").lower() for w in title.split()}
-        raw += len(words & POS) - len(words & RISK)
-    score = max(-1.0, min(1.0, raw / max(6, len(x)*0.35)))
-    if score <= -0.35:
-        return NewsRegime(score,"Risk-off","Headlines contain elevated geopolitical, inflation, recession, or policy-risk language.",x)
-    if score >= 0.35:
-        return NewsRegime(score,"Risk-on","Headlines contain more growth, easing, deal, approval, and rally language.",x)
-    return NewsRegime(score,"Mixed","Headline signals are balanced or inconclusive.",x)
+
+def _finnhub_news(symbol: str, limit: int) -> list[NewsItem]:
+    if not settings.finnhub_api_key:
+        return []
+
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=7)
+    payload = request_json(
+        "https://finnhub.io/api/v1/company-news",
+        params={
+            "symbol": symbol.upper(),
+            "from": start.isoformat(),
+            "to": today.isoformat(),
+            "token": settings.finnhub_api_key,
+        },
+    )
+
+    items = []
+    for row in payload[:limit]:
+        headline = row.get("headline", "Untitled")
+        summary = row.get("summary", "")
+        sentiment, score = score_text(f"{headline} {summary}")
+        items.append(NewsItem(
+            headline=headline,
+            source=row.get("source", "Finnhub"),
+            url=row.get("url", ""),
+            published_at=str(row.get("datetime", "")),
+            sentiment=sentiment,
+            score=score,
+            summary=summary,
+        ))
+    return items
+
+
+def _google_news(symbol: str, limit: int) -> list[NewsItem]:
+    query = symbol.replace(" ", "+")
+    feed = feedparser.parse(
+        f"https://news.google.com/rss/search?q={query}+market&hl=en-US&gl=US&ceid=US:en"
+    )
+    items = []
+    for entry in feed.entries[:limit]:
+        headline = entry.get("title", "Untitled")
+        raw_summary = entry.get("summary", "")
+        summary = re.sub("<[^>]+>", "", raw_summary)
+        sentiment, score = score_text(f"{headline} {summary}")
+        source_data = entry.get("source")
+        source = source_data.get("title", "Google News") if isinstance(source_data, dict) else "Google News"
+        items.append(NewsItem(
+            headline=headline,
+            source=source,
+            url=entry.get("link", ""),
+            published_at=entry.get("published", ""),
+            sentiment=sentiment,
+            score=score,
+            summary=summary,
+        ))
+    return items
+
+
+def get_market_news(symbol: str, limit: int = 8) -> list[NewsItem]:
+    try:
+        items = _finnhub_news(symbol, limit)
+        if items:
+            return items
+    except Exception:
+        pass
+    try:
+        return _google_news(symbol, limit)
+    except Exception:
+        return []
+
+
+def aggregate_news_sentiment(symbol: str, limit: int = 8) -> dict:
+    items = get_market_news(symbol, limit)
+    if not items:
+        return {"symbol": symbol.upper(), "sentiment": "Neutral", "score": 50, "count": 0, "items": []}
+
+    score = round(sum(x.score for x in items) / len(items))
+    sentiment = "Positive" if score > 55 else "Negative" if score < 45 else "Neutral"
+    return {"symbol": symbol.upper(), "sentiment": sentiment, "score": score, "count": len(items), "items": items}

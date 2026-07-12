@@ -1,99 +1,236 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
+
 import pandas as pd
 import streamlit as st
-from engine import *
-from news_intelligence import combined_regime
+
+import engine
+from api_manager import api_statuses
+from market_data import history, latest_snapshot, technical_features
+from market_predictor import convert_currency, forecast_market
+from news_intelligence import get_market_news
 from oracle_bot import render_oracle_bot
-st.set_page_config(page_title="Garibaldi Market Oracle — $10 Challenge", page_icon="💹", layout="wide")
+from risk_engine import risk_report
+
+
+st.set_page_config(
+    page_title="Garibaldi Market Oracle",
+    page_icon="📈",
+    layout="wide",
+)
+
 st.markdown("""
 <style>
-.stApp{background:radial-gradient(circle at 20% 10%,rgba(40,120,70,.15),transparent 30%),radial-gradient(circle at 80% 10%,rgba(120,70,160,.16),transparent 30%)}
-.title{text-align:center;font-weight:900;letter-spacing:.08em;font-size:clamp(1.6rem,4vw,3.2rem)}
-.sub{text-align:center;opacity:.8;margin-bottom:1rem}.board{border:1px solid rgba(255,255,255,.18);border-radius:18px;padding:1rem;background:rgba(20,20,25,.55);min-height:280px}
-.cash{box-shadow:-10px 0 40px rgba(40,170,90,.12)}.crypto{box-shadow:10px 0 40px rgba(155,90,220,.14)}.vs{text-align:center;font-size:2rem;font-weight:900;padding-top:5rem}
-@media(max-width:800px){.vs{padding-top:.5rem}}
+.block-container {max-width: 1180px; padding-top: 1.2rem;}
+div[data-testid="stMetric"] {
+    border: 1px solid rgba(120,120,120,.22);
+    border-radius: 14px;
+    padding: 14px;
+}
+.hero {font-size: clamp(2.2rem, 6vw, 4.8rem); font-weight: 900; line-height: .98;}
+.sub {font-size: 1.05rem; opacity: .78; margin: .8rem 0 1rem;}
+.card {border:1px solid rgba(120,120,120,.2); border-radius:16px; padding:18px; min-height:160px;}
 </style>
 """, unsafe_allow_html=True)
 
-init_db(); start_background_bot()
-st.markdown('<div class="title">GARIBALDI MARKET ORACLE™</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub">$10 CHALLENGE · CASH MARKET vs CRYPTO · SIMULATED TRADING PIT</div>', unsafe_allow_html=True)
+engine.init_db()
 
-with st.sidebar:
-    st.header("Control room")
-    if st.button("Run both scans now", width="stretch"):
-        run_once(); st.success("Both boards scanned."); st.rerun()
-    cv=st.toggle("Cash board bot", value=enabled("cash")); kv=st.toggle("Crypto board bot", value=enabled("crypto"))
-    if cv != enabled("cash"): set_enabled("cash",cv); st.rerun()
-    if kv != enabled("crypto"): set_enabled("crypto",kv); st.rerun()
-    st.caption(f"Scan interval: about {SCAN_SECONDS//60} minute(s)")
-    with st.expander("Reset the challenge"):
-        rc=st.checkbox("Reset cash board"); rk=st.checkbox("Reset crypto board")
-        if st.button("Reset selected boards", width="stretch"):
-            if rc: reset_board("cash")
-            if rk: reset_board("crypto")
-            st.success("Selected boards reset to $10."); st.rerun()
+st.markdown('<div class="hero">GARIBALDI MARKET ORACLE™</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub">Plain-language market intelligence for stocks, crypto, ETFs and world currencies.</div>',
+    unsafe_allow_html=True,
+)
+st.warning(
+    "Educational analysis and simulated paper trading only. Forecasts are estimates, not guarantees."
+)
 
-cs=account_snapshot("cash"); ks=account_snapshot("crypto")
-l,m,r=st.columns([1,.18,1])
-with l:
-    st.markdown('<div class="board cash">', unsafe_allow_html=True); st.markdown("## 💵 CASH MARKET PIT"); st.caption("Stocks · ETFs · gold · bonds · dollar · FX")
-    a,b=st.columns(2); a.metric("Equity",f"${cs['equity']:.2f}",f"${cs['pnl']:+.2f}"); b.metric("Return",f"{cs['return_pct']:.2f}%",f"DD {cs['drawdown_pct']:.2f}%")
-    a,b=st.columns(2); a.metric("Cash",f"${cs['cash']:.2f}"); b.metric("Positions",f"${cs['positions_value']:.2f}")
-    rg=combined_regime("cash"); st.write(f"**News regime:** {rg.label} ({rg.score:+.2f})"); st.caption(rg.explanation); st.markdown("</div>",unsafe_allow_html=True)
-with m: st.markdown('<div class="vs">VS</div>',unsafe_allow_html=True)
-with r:
-    st.markdown('<div class="board crypto">', unsafe_allow_html=True); st.markdown("## 🪙 CRYPTO PIT"); st.caption("Bitcoin · Ethereum · Solana · XRP · Dogecoin")
-    a,b=st.columns(2); a.metric("Equity",f"${ks['equity']:.2f}",f"${ks['pnl']:+.2f}"); b.metric("Return",f"{ks['return_pct']:.2f}%",f"DD {ks['drawdown_pct']:.2f}%")
-    a,b=st.columns(2); a.metric("Cash",f"${ks['cash']:.2f}"); b.metric("Positions",f"${ks['positions_value']:.2f}")
-    rg=combined_regime("crypto"); st.write(f"**News regime:** {rg.label} ({rg.score:+.2f})"); st.caption(rg.explanation); st.markdown("</div>",unsafe_allow_html=True)
-
-st.info("Each side begins with $10 in fake money. Fractional shares and crypto are allowed. Cash-market fills occur only during regular U.S. market hours; crypto can trade 24/7.")
-board=st.radio("Inspect a board",["Cash","Crypto"],horizontal=True).lower()
-tabs=st.tabstabs=st.tabs([
-    "Equity curve",
-    "Open positions",
-    "Paper trades",
-    "Live decisions",
-    "Market intelligence",
-    "Literacy lab",
-    "Bot health",
-    "Ask the Oracle"
+tabs = st.tabs([
+    "🏠 Home", "📈 Markets", "🔮 Forecast", "💱 Currency",
+    "📰 News", "🧪 Paper Trading", "🤖 Ask Oracle", "📚 Learn", "⚙️ Health"
 ])
+
 with tabs[0]:
-    x=equity_df(board)
-    if x.empty: st.write("No equity-history points yet. Run a scan or wait for the bot.")
-    else:
-        x["timestamp"]=pd.to_datetime(x["timestamp"],errors="coerce")
-        st.line_chart(x.dropna(subset=["timestamp"]).set_index("timestamp")[["equity","cash","positions_value"]],width="stretch")
+    st.subheader("Choose what you need")
+    c1, c2, c3 = st.columns(3)
+    c1.markdown('<div class="card"><h3>Stocks & ETFs</h3><p>See price, trend, risk, technical indicators and forecasts.</p><b>Examples:</b> AAPL, NVDA, SPY</div>', unsafe_allow_html=True)
+    c2.markdown('<div class="card"><h3>Crypto</h3><p>Study 24/7 digital-asset markets and volatility.</p><b>Examples:</b> BTC, ETH, SOL</div>', unsafe_allow_html=True)
+    c3.markdown('<div class="card"><h3>Fiat Currency</h3><p>Convert government-issued currencies and study FX pairs.</p><b>Examples:</b> USD/EUR, USD/MXN</div>', unsafe_allow_html=True)
+
+    st.subheader("Built-in protections")
+    st.write(
+        "The app uses position limits, maximum allocation per trade, confidence labels, risk reports, "
+        "paper trading only, and probability ranges instead of guaranteed targets."
+    )
+
 with tabs[1]:
-    x=positions_df(board); st.write("No open simulated positions." if x.empty else "")
-    if not x.empty: st.dataframe(x,width="stretch",hide_index=True)
+    st.subheader("Market snapshot")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        asset_type = st.selectbox("Asset type", ["Stock / ETF", "Crypto", "Fiat / FX"], key="market_type")
+        default = {"Stock / ETF": "AAPL", "Crypto": "BTC", "Fiat / FX": "USD/EUR"}[asset_type]
+        symbol = st.text_input("Symbol", value=default, key="market_symbol")
+        analyze = st.button("Analyze market", type="primary", use_container_width=True)
+
+    if analyze:
+        try:
+            snap = latest_snapshot(symbol, asset_type)
+            tech = technical_features(symbol, asset_type)
+            risk = risk_report(symbol, asset_type)
+
+            with c2:
+                a, b, c, d = st.columns(4)
+                a.metric("Price", f"{snap.price:,.4f}")
+                b.metric("Daily change", f"{snap.change_pct:+.2f}%")
+                c.metric("RSI", f"{tech['rsi14']:.1f}")
+                d.metric("Risk", f"{risk['label']} · {risk['score']}/100")
+
+            frame = history(symbol, period="1y", asset_type=asset_type)
+            st.line_chart(frame[["Close"]])
+
+            x1, x2, x3, x4 = st.columns(4)
+            x1.metric("20-day average", f"{tech['ma20']:,.4f}")
+            x2.metric("50-day average", f"{tech['ma50']:,.4f}")
+            x3.metric("Volatility", f"{tech['volatility'] * 100:.1f}%")
+            x4.metric("Max drawdown", f"{tech['max_drawdown'] * 100:.1f}%")
+            st.write("**Risk reasons:** " + "; ".join(risk["reasons"]))
+        except Exception as exc:
+            st.error(f"Analysis unavailable: {exc}")
+
 with tabs[2]:
-    x=trades_df(board); st.write("No simulated fills yet." if x.empty else "")
-    if not x.empty:
-        st.dataframe(x,width="stretch",hide_index=True)
-        st.download_button("Download trade history CSV",x.to_csv(index=False).encode(),file_name=f"{board}_10_dollar_trades.csv",mime="text/csv")
+    st.subheader("Probability-based forecast")
+    c1, c2, c3 = st.columns(3)
+    forecast_type = c1.selectbox("Asset type", ["Stock / ETF", "Crypto", "Fiat / FX"], key="forecast_type")
+    forecast_symbol = c2.text_input("Symbol or pair", value="BTC" if forecast_type == "Crypto" else "AAPL")
+    horizon = c3.slider("Days ahead", 1, 30, 5)
+
+    if st.button("Calculate forecast", type="primary"):
+        try:
+            result = forecast_market(forecast_symbol, horizon, forecast_type)
+            a, b, c, d = st.columns(4)
+            a.metric("Current", f"{result.current_price:,.4f}")
+            b.metric("Center estimate", f"{result.expected_price:,.4f}")
+            c.metric("Probability up", f"{result.probability_up * 100:.1f}%")
+            d.metric("Confidence", f"{result.confidence}/100")
+
+            st.markdown(f"### {result.symbol} · {result.trend}")
+            st.write(f"**Regime:** {result.market_regime} · **Risk:** {result.risk_level}")
+            r1, r2 = st.columns(2)
+            r1.metric("Lower range", f"{result.low_range:,.4f}")
+            r2.metric("Upper range", f"{result.high_range:,.4f}")
+            st.progress(result.confidence / 100)
+            st.write(result.explanation)
+            st.caption(f"Based on {result.sample_size} daily prices. Markets can move outside this range.")
+        except Exception as exc:
+            st.error(f"Forecast unavailable: {exc}")
+
 with tabs[3]:
-    x=signals_df(board); st.write("No decisions logged yet." if x.empty else "")
-    if not x.empty: st.dataframe(x,width="stretch",hide_index=True)
+    st.subheader("Fiat currency converter")
+    c1, c2, c3 = st.columns(3)
+    amount = c1.number_input("Amount", min_value=0.01, value=100.0)
+    source = c2.text_input("From", value="USD", max_chars=3).upper()
+    target = c3.text_input("To", value="EUR", max_chars=3).upper()
+
+    if st.button("Convert", type="primary"):
+        try:
+            converted, rate, pair = convert_currency(amount, source, target)
+            st.success(f"{amount:,.2f} {source} ≈ {converted:,.2f} {target}")
+            st.caption(f"Approximate market rate: 1 {source} = {rate:,.6f} {target} · Pair: {pair}")
+        except Exception as exc:
+            st.error(f"Conversion unavailable: {exc}")
+
 with tabs[4]:
-    rg=combined_regime(board); st.metric("Current headline regime",rg.label,f"{rg.score:+.2f}"); st.write(rg.explanation)
-    if rg.headlines.empty: st.write("Current headlines could not be retrieved.")
-    else:
-        for _,row in rg.headlines.head(12).iterrows():
-            st.markdown(f"**{row['title']}**"); st.caption(f"{row['source']} · {row['published']}")
-            if row["link"]: st.link_button("Open source",row["link"])
+    st.subheader("Market news and sentiment")
+    news_symbol = st.text_input("News search", value="Bitcoin")
+    if st.button("Load news"):
+        items = get_market_news(news_symbol, 10)
+        if not items:
+            st.info("No current articles were returned.")
+        for item in items:
+            st.markdown(f"**{item.headline}**")
+            st.caption(f"{item.source} · {item.sentiment} {item.score}/100 · {item.published_at}")
+            if item.summary:
+                st.write(item.summary[:400])
+            if item.url:
+                st.markdown(f"[Open article]({item.url})")
+            st.divider()
+
 with tabs[5]:
-    st.subheader("Financial literacy before prediction")
-    st.markdown("""**Five principles:** liquidity first; fractional sizing; regime awareness; central-bank literacy; and evidence over mythology.
+    st.subheader("$10 paper-trading challenge")
+    board = st.radio("Board", ["cash", "crypto"], horizontal=True)
+    snap = engine.account_snapshot(board)
+    a, b, c, d = st.columns(4)
+    a.metric("Total value", f"${snap['equity']:.2f}")
+    b.metric("Profit / loss", f"${snap['pnl']:+.2f}")
+    c.metric("Cash", f"${snap['cash']:.2f}")
+    d.metric("Return", f"{snap['return_pct']:.2f}%")
 
-*The Creature from Jekyll Island* raises influential criticisms of central banking and concentrated financial power. Some historical events it discusses are real, while several broader claims are disputed. This app uses the useful questions—who supplies liquidity, who bears risk, and how policy changes incentives—without treating disputed conclusions as facts.
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Run scan now", use_container_width=True):
+        try:
+            engine.run_once()
+            st.success("Scan complete.")
+        except Exception as exc:
+            st.error(str(exc))
+    enabled_now = engine.enabled(board)
+    new_enabled = c2.toggle("Bot enabled", value=enabled_now)
+    if new_enabled != enabled_now:
+        engine.set_enabled(board, new_enabled)
+    if c3.button("Reset this board", use_container_width=True):
+        engine.reset_board(board)
+        st.success("Board reset.")
 
-The algorithm combines trend, momentum, RSI, volatility, headline regime, stop loss, take profit, trailing stop, slippage, position limits, and fractional sizing. It does not know the future.""")
+    t1, t2, t3, t4, t5 = st.tabs(["Growth", "Positions", "Trades", "Signals", "Health"])
+    with t1:
+        frame = engine.equity_df(board)
+        st.info("No equity history yet.") if frame.empty else st.line_chart(frame.set_index("timestamp")[["equity", "cash", "positions_value"]])
+    with t2:
+        frame = engine.positions_df(board)
+        st.info("No open positions.") if frame.empty else st.dataframe(frame, use_container_width=True, hide_index=True)
+    with t3:
+        frame = engine.trades_df(board)
+        st.info("No trades yet.") if frame.empty else st.dataframe(frame, use_container_width=True, hide_index=True)
+    with t4:
+        frame = engine.signals_df(board)
+        st.info("No signals yet.") if frame.empty else st.dataframe(frame, use_container_width=True, hide_index=True)
+    with t5:
+        st.dataframe(engine.status_df(), use_container_width=True, hide_index=True)
+
 with tabs[6]:
-    st.dataframe(status_df(),width="stretch",hide_index=True)
-    st.caption("Refreshed "+datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
-with tabs[7]:
+    st.subheader("Ask the Oracle")
     render_oracle_bot()
-st.divider(); st.caption("Educational paper trading only. No real broker orders. No guarantee of profit or of turning $10 into wealth. Public market data and RSS feeds can be delayed or unavailable.")
+
+with tabs[7]:
+    st.subheader("Money basics")
+    st.markdown("""
+**Crypto:** Digital assets that trade around the clock and can be extremely volatile.
+
+**Fiat currency:** Government-issued money such as USD, EUR, GBP, JPY and MXN.
+
+**ETF:** A basket of assets traded like a stock.
+
+**Volatility:** How sharply price moves. Higher volatility means greater upside and downside.
+
+**Drawdown:** The decline from a prior peak.
+
+**Diversification:** Spreading risk across different assets rather than relying on one outcome.
+
+**Liquidity:** How easily an asset can be bought or sold without heavily moving its price.
+
+**Probability range:** A band of plausible outcomes. It is more honest than claiming one exact future price.
+
+**Safety rule:** Never risk rent, food, transportation, emergency savings or borrowed money.
+""")
+
+with tabs[8]:
+    st.subheader("System health")
+    for item in api_statuses():
+        st.write(f"{'✅' if item.configured else '⚠️'} **{item.name}:** {item.purpose}")
+    st.dataframe(engine.status_df(), use_container_width=True, hide_index=True)
+    st.caption("Checked " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+st.divider()
+st.caption(
+    "GARIBALDI MARKET ORACLE™ provides educational market analysis and simulated trades only. "
+    "No real orders and no guaranteed returns."
+)
